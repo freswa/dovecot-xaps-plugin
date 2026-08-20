@@ -27,6 +27,9 @@
 #include <lib.h>
 #include <str.h>
 #include <imap-common.h>
+#include <imap-quote.h>
+#include <mail-storage.h>
+#include <mail-namespace.h>
 #include <http-client-private.h>
 
 #include "xaps-imap-plugin.h"
@@ -205,6 +208,31 @@ int xaps_register(struct client_command_context *cmd, struct xaps_attr *xaps_att
 }
 
 /*
+ * Check whether the given mailbox actually exists for this user. Only
+ * existing mailboxes are echoed back in the registration response.
+ */
+static bool mailbox_is_valid(struct mail_user *user, const char *mailbox) {
+    struct mail_namespace *ns;
+    struct mailbox *box;
+    enum mailbox_existence existence = MAILBOX_EXISTENCE_NONE;
+    bool valid = FALSE;
+
+    ns = mail_namespace_find(user->namespaces, mailbox);
+    if (ns == NULL) {
+        return FALSE;
+    }
+
+    box = mailbox_alloc(ns->list, mailbox, 0);
+    if (mailbox_exists(box, TRUE, &existence) == 0 &&
+        existence != MAILBOX_EXISTENCE_NONE) {
+        valid = TRUE;
+    }
+    mailbox_free(&box);
+
+    return valid;
+}
+
+/*
  * Register the client at the xapsd
  */
 static bool register_client(struct client_command_context *cmd, struct xaps_attr *xaps_attr) {
@@ -224,13 +252,43 @@ static bool register_client(struct client_command_context *cmd, struct xaps_attr
     http_client_wait(xaps_global->http_client);
 
     /*
+     * Echo back the mailboxes that were requested and are actually valid
+     * (existing) mailboxes for this user, one untagged response per
+     * mailbox.
+     * This is required by the iOS clients to build an index of watched
+     * mailboxes and display push alerts when a mailbox hash is specified
+     * in the APS payload.
+     */
+    unsigned int registered_mailboxes = 0;
+    if (xaps_attr->mailboxes != NULL) {
+        for (int i = 0; !IMAP_ARG_IS_EOL(&xaps_attr->mailboxes[i]); i++) {
+            const char *mailbox;
+            if (!imap_arg_get_astring(&xaps_attr->mailboxes[i], &mailbox)) {
+                continue;
+            }
+            if (!mailbox_is_valid(cmd->client->user, mailbox)) {
+                continue;
+            }
+
+            string_t *line = t_str_new(64);
+            str_append(line, "* XAPPLEPUSHSERVICE mailbox ");
+            imap_append_string(line, mailbox);
+            client_send_line(cmd->client, str_c(line));
+            registered_mailboxes++;
+        }
+    }
+
+    /*
      * Return success. We assume that aps_version and aps_topic do not
      * contain anything that needs to be escaped.
      */
     client_send_line(cmd->client,
-                     t_strdup_printf("* XAPPLEPUSHSERVICE aps-version %s aps-topic %s", xaps_attr->aps_version,
+                     t_strdup_printf("* XAPPLEPUSHSERVICE aps-version \"%s\" aps-topic \"%s\"", xaps_attr->aps_version,
                                      xaps_global->aps_topic));
     client_send_tagline(cmd, "OK XAPPLEPUSHSERVICE completed.");
+
+    i_debug("Successfully registered %u mailboxe(s) using topic %s",
+            registered_mailboxes, xaps_global->aps_topic);
     return TRUE;
 }
 
